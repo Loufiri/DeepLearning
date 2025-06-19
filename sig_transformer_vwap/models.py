@@ -394,3 +394,119 @@ class DynamicSigVWAPTransformer(Model):
 
     def compute_output_shape(self, input_shape):
         return (input_shape[0], 2, self.n_ahead)
+    
+
+@keras.utils.register_keras_serializable(name="DynamicVWAPTransformer")
+class DynamicVWAPTransformer(Model):
+    def __init__(self, lookback, n_ahead, hidden_size=100, hidden_rnn_layer=2, num_heads=3, num_embedding=3, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.lookback = lookback
+        self.n_ahead = n_ahead
+        self.hidden_size = hidden_size
+        self.hidden_rnn_layer = hidden_rnn_layer
+        self.num_embedding = num_embedding
+        self.num_heads = num_heads
+
+    def build(self, input_shape):
+        feature_shape = input_shape
+        assert feature_shape[1] == self.lookback + self.n_ahead - 1
+
+        self.embedding = EmbeddingLayer(self.num_embedding)
+        self.embedding.build(input_shape)
+        embedding_output_shape = self.embedding.compute_output_shape(input_shape)
+        self.vsn = VariableSelectionNetwork(self.hidden_size)
+        self.vsn.build(embedding_output_shape)
+        vsn_output_shape = (input_shape[0], input_shape[1], self.hidden_size)
+
+        self.internal_rnn = Sequential([
+            TKAN(self.hidden_size, return_sequences=True)
+            for _ in range(self.hidden_rnn_layer)
+        ])
+        self.internal_rnn.build(vsn_output_shape)
+        self.gate = Gate()
+        self.gate.build(vsn_output_shape)
+        self.addnorm = AddAndNorm()
+        self.addnorm.build([vsn_output_shape, vsn_output_shape])
+        self.grn = GRN(self.hidden_size)
+        self.grn.build(vsn_output_shape)
+
+        self.attention = MultiHeadAttention(
+            num_heads=self.num_heads,
+            key_dim=self.hidden_size // self.num_heads,
+            value_dim=self.hidden_size // self.num_heads,
+            use_bias=True
+        )
+        self.attention.build([vsn_output_shape, vsn_output_shape, vsn_output_shape])
+
+        self.internal_hidden_to_volume = [
+            Sequential([
+                Dense(self.hidden_size, activation='relu'),
+                Dense(self.hidden_size, activation='relu'),
+                Dense(1, activation='tanh')
+            ]) for _ in range(self.n_ahead - 1)
+        ]
+        for i in range(self.n_ahead - 1):
+            self.internal_hidden_to_volume[i].build((feature_shape[0], self.hidden_size + i))
+
+        self.base_volume_curve = self.add_weight(
+            shape=(self.n_ahead,),
+            name="base_curve",
+            initializer=EqualInitializer(self.n_ahead),
+            constraint=PositiveSumToOneConstraint(),
+            trainable=True
+        )
+        super(DynamicVWAPTransformer, self).build(input_shape)
+
+    def call(self, inputs):
+        embedded_features = self.embedding(inputs)
+        selected = self.vsn(embedded_features)
+        rnn_hidden = self.internal_rnn(selected)
+        all_context = self.addnorm([self.gate(rnn_hidden), selected])
+        enriched = self.grn(all_context)
+
+        attended_hidden = self.attention(
+            query=enriched,
+            value=enriched,
+            key=enriched,
+            use_causal_mask=True
+        )
+
+        total_volume = ops.zeros((ops.shape(inputs)[0], 1))
+
+        for t in range(0, self.n_ahead - 1):
+            if t > 0:
+                current_hidden = ops.concatenate([attended_hidden[:, self.lookback + t, :], volume_curve], axis=1)
+            else:
+                current_hidden = attended_hidden[:, self.lookback + t, :]
+
+            estimated_factor = 1. + self.internal_hidden_to_volume[t](current_hidden)
+            estimated_volume = self.base_volume_curve[t] * estimated_factor
+            estimated_volume = keras.ops.clip(estimated_volume, 0., 1. - total_volume)
+            total_volume += estimated_volume
+
+            if t == 0:
+                volume_curve = estimated_volume
+            else:
+                volume_curve = ops.concatenate([volume_curve, estimated_volume], axis=1)
+
+        estimated_volume = 1. - total_volume
+        volume_curve = ops.concatenate([volume_curve, estimated_volume], axis=1)
+        volume_curve = ops.expand_dims(volume_curve, axis=2)
+
+        results = keras.ops.concatenate([volume_curve, keras.ops.zeros_like(volume_curve)], axis=-1)
+        return results
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'lookback': self.lookback,
+            'n_ahead': self.n_ahead,
+            'hidden_size': self.hidden_size,
+            'hidden_rnn_layer': self.hidden_rnn_layer,
+            'num_embedding': self.num_embedding,
+            'num_heads': self.num_heads
+        })
+        return config
+
+    def compute_output_shape(self, input_shape):
+        return (input_shape[0], 2, self.n_ahead)
