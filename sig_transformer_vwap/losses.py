@@ -61,7 +61,7 @@ def vwap_afs_loss(y_true, y_pred, lambda_impact=0.01, eta_impact=0.01):
     impact_temporaire = eta_impact * pred_v
 
     exec_price = true_p + impact_permanent + impact_temporaire
-    cost = exec_price * pred_v
+    cost = ops.sum(exec_price * pred_v, axis=1) / ops.sum(pred_v, axis=1)
     impact_loss = ops.mean(ops.sum(cost, axis=1))
 
     return vwap_loss + impact_loss
