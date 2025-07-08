@@ -48,20 +48,16 @@ def vwap_afs_loss(y_true, y_pred, lambda_impact=0.01, eta_impact=0.01):
     true_v = y_true[..., 0]       # volume de marché
     true_p = y_true[..., 1]       # prix du marché
 
-    # === VWAP Loss ===
-    vwap_exec = ops.sum(pred_v * true_p, axis=1) / ops.sum(pred_v, axis=1)
-    vwap_mkt = ops.sum(true_v * true_p, axis=1) / ops.sum(true_v, axis=1)
-    vwap_diff = vwap_exec / vwap_mkt - 1.
-    vwap_loss = ops.mean(ops.square(vwap_diff))
-
-    # === Impact Almgren–Chriss ===
+    # === VWAP with market impact Loss ===
     cum_pred_v = ops.cumsum(pred_v, axis=1)  # volume cumulé
 
     impact_permanent = lambda_impact * cum_pred_v
     impact_temporaire = eta_impact * pred_v
 
     exec_price = true_p + impact_permanent + impact_temporaire
-    cost = ops.sum(exec_price * pred_v, axis=1) / ops.sum(pred_v, axis=1)
-    impact_loss = ops.mean(cost)
+    vwap_exec = ops.sum(exec_price * pred_v, axis=1) / ops.sum(pred_v, axis=1)
+    vwap_mkt = ops.sum(true_v * true_p, axis=1) / ops.sum(true_v, axis=1)
+    vwap_diff = vwap_exec / vwap_mkt - 1.
+    vwap_loss = ops.mean(ops.square(vwap_diff))
 
-    return vwap_loss + impact_loss
+    return vwap_loss
